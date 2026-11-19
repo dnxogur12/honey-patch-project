@@ -35,6 +35,7 @@ cmake --build build -j
 python3 tests/run_cases.py          # 또는: (cd build && ctest --output-on-failure)
 python3 tests/fork_limit_test.py    # [fork] 동시 Decoy 수 제한 (상한 16) 검증
 python3 tests/fork_isolation_test.py  # [fork] Decoy 자원 제한(setrlimit) 적용 검증
+python3 tests/fork_failure_test.py    # [fork] fork() 실패 시 403 대체·서버 생존 검증
 
 # 서버 직접 실행
 ./build/honeypatch_server --mode honeypatch --port 8080   # unpatched | patched | honeypatch
@@ -184,7 +185,7 @@ honeypatch  boundary      200      no      1    200/200   200  PASS
 |---|---|---|
 | **A. HTTP** | `src/http/*` | Content-Length 본문 처리(POST), 중복 쿼리 파라미터 정책, 헤더 상한·잘못된 요청 경계 사례 테스트, (필요 시) 단일 스레드 유지한 채 poll/epoll로 동시 연결 처리 |
 | **B. 탐지** | `src/detect/*` | base_dir 기준 정규화 판정, 이중 인코딩(`%252e%252e%252f`), 역슬래시·심볼릭 링크, 13주차 반례(오탐·미탐) 테스트 추가 |
-| **C. fork** | `src/hpfork/*` | ~~SIGCHLD 종료·세션 시간 기록~~, ~~동시 Decoy 수 제한(16)~~, ~~격리: setrlimit·no_new_privs~~ (완료), fork 실패 처리 검증, (선택) root 실행 시 권한 하향·chroot |
+| **C. fork** | `src/hpfork/*` | ~~SIGCHLD 종료·세션 시간 기록~~, ~~동시 Decoy 수 제한(16)~~, ~~격리: setrlimit·no_new_privs~~, ~~fork 실패 처리 검증~~ (완료), (선택) root 실행 시 권한 하향·chroot |
 | **D. Decoy** | `src/decoy/*` | honey data 파일에서 가짜 값 로드, 원본과 같은 형식의 가짜 값 생성, 미패치 응답과 구분 불가능한지 점검(상태코드·헤더·본문), 정규화된 경로 기준 대상 매핑 |
 | **통합·검증** | `src/app/*`, `tests/run_cases.py` | 12주차 보고서용 전·후 비교 결과 기록, 타 환경 재현 확인, 13주차 사례 확장, 14주차 측정 지표(분기 지연 시간 등) 추가 |
 
