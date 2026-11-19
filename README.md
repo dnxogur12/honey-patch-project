@@ -33,6 +33,9 @@ cmake --build build -j
 # 테스트 (단위 테스트 + 고정 검증 사례 3종 × 3모드)
 ./build/unit_tests
 python3 tests/run_cases.py          # 또는: (cd build && ctest --output-on-failure)
+python3 tests/fork_limit_test.py    # [fork] 동시 Decoy 수 제한 (상한 16) 검증
+python3 tests/fork_isolation_test.py  # [fork] Decoy 자원 제한(setrlimit) 적용 검증
+python3 tests/fork_failure_test.py    # [fork] fork() 실패 시 403 대체·서버 생존 검증
 
 # 서버 직접 실행
 ./build/honeypatch_server --mode honeypatch --port 8080   # unpatched | patched | honeypatch
@@ -127,6 +130,7 @@ common  ←  http · detect · hpfork · decoy  ←  app  ←  main
 - `DetectResult::reason`과 방어자 로그는 공격자 응답에 절대 넣지 않습니다. 응답 헤더와 본문도 모드와 관계없이 같은 형식이어야 합니다.
 - 서버는 **단일 스레드**를 유지합니다. 스레드가 있는 프로세스에서 `fork()`하면 호출한 스레드만 복제되어 락과 상태가 깨질 수 있습니다.
 - 로그는 `logger::write()`만 사용합니다. `printf`처럼 stdio 버퍼를 쓰면 fork 후 같은 로그가 두 번 출력됩니다.
+- 시그널 핸들러 안에서는 `logger::write_signal_safe()`만 사용합니다. 이 함수 안에서 `std::string`, `malloc`, `localtime`을 쓰지 않습니다 (핸들러가 malloc 도중에 끼어들면 서버가 멈추거나 힙이 깨짐).
 
 ## 5. 검증 사례 (11주차 고정 사례 유지) 와 판정 기준
 
@@ -164,7 +168,7 @@ honeypatch  boundary      200      no      1    200/200   200  PASS
 |---|---|---|---|
 | 세션 복제 | CRIU로 프로세스 체크포인트 → LXC Decoy 컨테이너에서 복원 | 단일 호스트 `fork()` | 학부 실습 환경에 맞춘 경량화 (11주차 결정) |
 | 연결 전환 | 프록시를 통한 연결 전환 | 자식이 TCP 소켓 FD를 상속해 같은 연결 유지 | 부모는 FD를 닫고 다음 연결 처리 |
-| 격리 | 컨테이너 단위 격리 (파일시스템 등 분리) | **격리 없음.** 같은 사용자 권한과 파일시스템을 공유하고, `alarm()` 수명 제한만 둠 | Decoy에서 탐지를 우회하면 실제 파일을 읽을 수 있음 → 한계로 기록 |
+| 격리 | 컨테이너 단위 격리 (파일시스템 등 분리) | **자원 제한만 적용.** `alarm()` 수명 제한 + `setrlimit`(CPU 5초, 메모리 256MB, FD 16개, 프로세스 생성 금지, 코어 덤프 금지) + `no_new_privs`. 같은 사용자 권한과 파일시스템은 그대로 공유 | 권한 하향·chroot는 root가 필요해 미적용. Decoy에서 탐지를 우회하면 실제 파일을 읽을 수 있음 → 한계로 기록 |
 | Redaction 범위 | 복제된 프로세스 메모리의 민감정보를 가짜 데이터로 대체 | `SecretStore`에 지정한 항목만 소거·대체 | 힙에 남은 이전 사본은 지우지 못함 |
 | API | `hp_init` / `hp_fork` / `hp_skip` 라이브러리 | 개념만 대응: `hpfork::init`, `hpfork::fork_decoy`, `decoy::fake_success` | 기존 구현을 가져오지 않고 직접 작성 |
 | 대상 서버·취약점 | 실제 서버 소프트웨어의 실제 취약점 패치 | 직접 작성한 소형 HTTP 서버의 모의 경로 탐색 취약점 | |
@@ -181,7 +185,7 @@ honeypatch  boundary      200      no      1    200/200   200  PASS
 |---|---|---|
 | **A. HTTP** | `src/http/*` | Content-Length 본문 처리(POST), 중복 쿼리 파라미터 정책, 헤더 상한·잘못된 요청 경계 사례 테스트, (필요 시) 단일 스레드 유지한 채 poll/epoll로 동시 연결 처리 |
 | **B. 탐지** | `src/detect/*` | base_dir 기준 정규화 판정, 이중 인코딩(`%252e%252e%252f`), 역슬래시·심볼릭 링크, 13주차 반례(오탐·미탐) 테스트 추가 |
-| **C. fork** | `src/hpfork/*` | SIGCHLD 핸들러로 Decoy 종료·세션 시간 기록, Decoy 격리 강화(setrlimit·권한 하향·chroot 등), 동시 Decoy 수 제한, fork 실패 처리 검증 |
+| **C. fork** | `src/hpfork/*` | ~~SIGCHLD 종료·세션 시간 기록~~, ~~동시 Decoy 수 제한(16)~~, ~~격리: setrlimit·no_new_privs~~, ~~fork 실패 처리 검증~~ (완료), (선택) root 실행 시 권한 하향·chroot |
 | **D. Decoy** | `src/decoy/*` | honey data 파일에서 가짜 값 로드, 원본과 같은 형식의 가짜 값 생성, 미패치 응답과 구분 불가능한지 점검(상태코드·헤더·본문), 정규화된 경로 기준 대상 매핑 |
 | **통합·검증** | `src/app/*`, `tests/run_cases.py` | 12주차 보고서용 전·후 비교 결과 기록, 타 환경 재현 확인, 13주차 사례 확장, 14주차 측정 지표(분기 지연 시간 등) 추가 |
 

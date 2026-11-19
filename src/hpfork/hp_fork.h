@@ -15,7 +15,9 @@ enum class ForkResult {
     Failed,        // fork() 실패: 호출자는 일반 패치(403)로 대체 처리
 };
 
-// 서버 시작 시 1회 호출 (hp_init 대응). 종료된 Decoy 자식의 좀비 회수 설정 등.
+// 서버 시작 시 1회 호출 (hp_init 대응).
+// SIGCHLD 핸들러를 등록해 종료된 Decoy 자식을 회수하고, 종료 사유·세션 시간을 로그로 남긴다.
+//   예) [FORK] conn=2 decoy pid=5271 ended: exit code=0 duration=3.214s
 void init();
 
 // 패치 지점에서 공격 탐지 시 호출 (hp_fork 대응).
