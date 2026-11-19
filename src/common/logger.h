@@ -15,4 +15,9 @@ void init(const std::string& path);
 // tag 예: "HTTP", "APP", "DETECT", "FORK", "DECOY"
 void write(const char* tag, const std::string& msg);
 
+// 시그널 핸들러 안에서 쓰는 버전 (async-signal-safe). 출력 형식은 write()와 같다.
+// std::string·malloc·localtime을 쓰지 않으므로 핸들러가 언제 끼어들어도 안전하다.
+// 일반 코드에서는 write()를 쓸 것.
+void write_signal_safe(const char* tag, const char* msg);
+
 }  // namespace hp::logger

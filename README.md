@@ -127,6 +127,7 @@ common  ←  http · detect · hpfork · decoy  ←  app  ←  main
 - `DetectResult::reason`과 방어자 로그는 공격자 응답에 절대 넣지 않습니다. 응답 헤더와 본문도 모드와 관계없이 같은 형식이어야 합니다.
 - 서버는 **단일 스레드**를 유지합니다. 스레드가 있는 프로세스에서 `fork()`하면 호출한 스레드만 복제되어 락과 상태가 깨질 수 있습니다.
 - 로그는 `logger::write()`만 사용합니다. `printf`처럼 stdio 버퍼를 쓰면 fork 후 같은 로그가 두 번 출력됩니다.
+- 시그널 핸들러 안에서는 `logger::write_signal_safe()`만 사용합니다. 이 함수 안에서 `std::string`, `malloc`, `localtime`을 쓰지 않습니다 (핸들러가 malloc 도중에 끼어들면 서버가 멈추거나 힙이 깨짐).
 
 ## 5. 검증 사례 (11주차 고정 사례 유지) 와 판정 기준
 
