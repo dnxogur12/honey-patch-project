@@ -33,6 +33,7 @@ cmake --build build -j
 # 테스트 (단위 테스트 + 고정 검증 사례 3종 × 3모드)
 ./build/unit_tests
 python3 tests/run_cases.py          # 또는: (cd build && ctest --output-on-failure)
+python3 tests/fork_limit_test.py    # [fork] 동시 Decoy 수 제한 (상한 16) 검증
 
 # 서버 직접 실행
 ./build/honeypatch_server --mode honeypatch --port 8080   # unpatched | patched | honeypatch

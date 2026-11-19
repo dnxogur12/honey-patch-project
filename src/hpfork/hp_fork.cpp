@@ -16,7 +16,10 @@ namespace hp::hpfork {
 
 namespace {
 constexpr unsigned kDecoyMaxLifetimeSec = 120;  // Decoy 자식 최대 수명 (SIGALRM 기본 동작 = 종료)
-constexpr int kMaxTrackedDecoys = 64;           // 동시에 추적하는 Decoy 세션 수
+// 동시에 살아 있을 수 있는 Decoy 최대 수 (= 세션 표 크기).
+// 공격이 몰려 fork가 무한히 일어나면 프로세스 수가 폭증해 서버 전체가 죽을 수 있으므로 상한을 둔다.
+// 표가 꽉 차면 fork하지 않고 Failed를 반환 → app이 일반 패치(403)로 대체 응답한다.
+constexpr int kMaxConcurrentDecoys = 16;
 
 // ---------------------------------------------------------------------------
 // 살아 있는 Decoy 세션 표 (부모 프로세스 전용)
@@ -30,7 +33,11 @@ struct DecoySlot {
     std::uint64_t conn_id = 0;
     timespec start{};  // fork 직전 시각 (CLOCK_MONOTONIC)
 };
-DecoySlot g_slots[kMaxTrackedDecoys];
+DecoySlot g_slots[kMaxConcurrentDecoys];
+
+// SIGCHLD 핸들러 등록에 성공했는지. 실패해 SIG_IGN으로 대체된 경우에는 칸이 비워지지 않으므로
+// 개수 제한을 적용하지 않는다 (적용하면 16번 공격 후 영원히 403만 나감).
+bool g_reaper_installed = false;
 
 // 핸들러에서 로그 메시지를 만들기 위한 고정 버퍼 (std::string 대신)
 struct MsgBuf {
@@ -121,17 +128,12 @@ void on_sigchld(int) {
     errno = saved_errno;
 }
 
-// 빈 칸에 세션 등록. SIGCHLD가 막힌 상태에서만 호출할 것. 표가 꽉 찼으면 false.
-bool track_decoy(pid_t pid, std::uint64_t conn_id, const timespec& start) {
+// 빈 칸 찾기. SIGCHLD가 막힌 상태에서만 호출할 것. 표가 꽉 찼으면 nullptr.
+DecoySlot* find_free_slot() {
     for (auto& s : g_slots) {
-        if (s.pid == 0) {
-            s.pid = pid;
-            s.conn_id = conn_id;
-            s.start = start;
-            return true;
-        }
+        if (s.pid == 0) return &s;
     }
-    return false;
+    return nullptr;
 }
 }  // namespace
 
@@ -142,7 +144,9 @@ void init() {
     // SA_RESTART  : 핸들러가 끝나면 중단된 accept() 등을 자동으로 다시 실행
     // SA_NOCLDSTOP: 자식이 일시정지(SIGSTOP)할 때는 알리지 않고, 종료할 때만 알림
     sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-    if (::sigaction(SIGCHLD, &sa, nullptr) < 0) {
+    if (::sigaction(SIGCHLD, &sa, nullptr) == 0) {
+        g_reaper_installed = true;
+    } else {
         // 등록 실패 시 최소한 좀비만은 막도록 이전 방식(커널 자동 회수)으로 대체
         logger::write("FORK", std::string("sigaction(SIGCHLD) failed: ") + std::strerror(errno) +
                                   ", fallback to SIG_IGN");
@@ -165,6 +169,16 @@ ForkResult fork_decoy(ConnContext& ctx) {
     sigemptyset(&chld_only);
     sigaddset(&chld_only, SIGCHLD);
     ::sigprocmask(SIG_BLOCK, &chld_only, &old_mask);
+
+    // 동시 Decoy 수 제한: fork하기 "전에" 빈 칸이 있는지 확인한다.
+    // (fork 후에 확인하면 이미 만든 자식을 다시 죽여야 하므로)
+    DecoySlot* slot = find_free_slot();
+    if (!slot && g_reaper_installed) {
+        ::sigprocmask(SIG_SETMASK, &old_mask, nullptr);
+        logger::write("FORK", conn + " decoy limit reached (" + std::to_string(kMaxConcurrentDecoys) +
+                                  " alive), no fork");
+        return ForkResult::Failed;
+    }
 
     timespec start{};
     ::clock_gettime(CLOCK_MONOTONIC, &start);
@@ -193,7 +207,11 @@ ForkResult fork_decoy(ConnContext& ctx) {
     }
 
     // ---- 부모 (Main) ----
-    const bool tracked = track_decoy(pid, ctx.conn_id, start);
+    if (slot) {  // 핸들러 등록 실패(SIG_IGN 대체) 상태에서 표가 꽉 찼을 때만 nullptr
+        slot->pid = pid;
+        slot->conn_id = ctx.conn_id;
+        slot->start = start;
+    }
 
     // 공격 연결은 자식 소유가 되었으므로 부모 쪽 FD를 닫는다.
     // (부모가 계속 열고 있으면 자식이 종료해도 TCP 연결이 닫히지 않음)
@@ -201,7 +219,6 @@ ForkResult fork_decoy(ConnContext& ctx) {
     ctx.client_fd = -1;
     ctx.handed_off = true;
     logger::write("FORK", conn + " handed off to decoy pid=" + std::to_string(pid));
-    if (!tracked) logger::write("FORK", conn + " warning: session table full, duration not tracked");
 
     // 여기서 차단을 푼다. 그사이 자식이 이미 끝났다면 지금 핸들러가 실행된다.
     ::sigprocmask(SIG_SETMASK, &old_mask, nullptr);
