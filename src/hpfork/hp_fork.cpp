@@ -1,6 +1,8 @@
 #include "hpfork/hp_fork.h"
 
 #include <signal.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -108,6 +110,7 @@ void on_sigchld(int) {
             m.str("killed by signal=");
             m.num(static_cast<unsigned long long>(sig));
             if (sig == SIGALRM) m.str(" (lifetime limit)");
+            if (sig == SIGXCPU) m.str(" (cpu limit)");
         }
 
         if (slot) {
@@ -134,6 +137,57 @@ DecoySlot* find_free_slot() {
         if (s.pid == 0) return &s;
     }
     return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Decoy 격리 (자식에서 fork 직후 1회 호출)
+//
+// Decoy는 공격자가 붙어 있는 프로세스라, 공격자가 탐지를 우회하거나 코드 실행까지 성공했을 때
+// 피해 범위를 줄이기 위해 자원 사용을 제한한다. 모두 root 권한 없이 가능한 방법만 쓴다.
+// 한 번 낮춘 한도는 이 프로세스 안에서 다시 올릴 수 없다 (soft = hard 로 설정).
+// 부모(Main)에는 영향이 없다: rlimit은 프로세스별 설정이다.
+//
+// 적용하지 않은 것 (root 필요 → README '원논문과 다른 부분'의 격리 한계로 기록):
+//   - setuid/setgid로 권한 하향, chroot/네임스페이스로 파일시스템 분리
+// ---------------------------------------------------------------------------
+struct DecoyLimit {
+    int resource;
+    rlim_t value;
+    const char* name;
+};
+constexpr DecoyLimit kDecoyLimits[] = {
+    // CPU 사용 시간(초). 넘으면 커널이 SIGXCPU로 종료 → 무한 루프 등으로 CPU를 독점하지 못함.
+    // (alarm은 "실제 경과 시간" 제한, 이건 "CPU를 실제로 쓴 시간" 제한)
+    {RLIMIT_CPU, 5, "cpu_sec"},
+    // 가상 메모리 상한 256MB. 메모리를 계속 할당해 서버 머신을 압박하지 못함.
+    {RLIMIT_AS, 256ULL * 1024 * 1024, "mem_bytes"},
+    // 열 수 있는 FD 번호 상한. 상속받은 client_fd·로그 FD는 이미 열려 있으므로 영향 없음.
+    {RLIMIT_NOFILE, 16, "nofile"},
+    // 새 프로세스 생성 금지 (fork/쉘 실행 등으로 프로세스를 늘리지 못함). root는 이 제한을 무시함.
+    {RLIMIT_NPROC, 0, "nproc"},
+    // 코어 덤프 금지 (Redaction 전 메모리의 진짜 비밀이 덤프 파일로 남는 것 방지).
+    {RLIMIT_CORE, 0, "core"},
+    // 주의: RLIMIT_FSIZE(파일 크기)는 걸지 않는다. 방어자 로그 파일(append)이 그 크기를 넘으면
+    //       Decoy가 로그를 쓰다가 SIGXFSZ로 죽기 때문.
+};
+
+void isolate_decoy(const std::string& conn) {
+    std::string applied;
+    for (const auto& l : kDecoyLimits) {
+        rlimit rl{l.value, l.value};
+        if (::setrlimit(l.resource, &rl) == 0) {
+            applied += std::string(" ") + l.name + "=" + std::to_string(l.value);
+        } else {
+            logger::write("FORK", conn + " warning: setrlimit " + l.name + " failed: " + std::strerror(errno));
+        }
+    }
+    // 이후 execve로 setuid 프로그램(sudo 등)을 실행해도 권한이 올라가지 않도록 고정
+    if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0) {
+        applied += " no_new_privs=1";
+    } else {
+        logger::write("FORK", conn + " warning: PR_SET_NO_NEW_PRIVS failed: " + std::strerror(errno));
+    }
+    logger::write("FORK", conn + " decoy isolation:" + applied);
 }
 }  // namespace
 
@@ -201,8 +255,8 @@ ForkResult fork_decoy(ConnContext& ctx) {
         ctx.listen_fd = -1;
         ctx.role = ProcessRole::Decoy;
         ::alarm(kDecoyMaxLifetimeSec);
-        // TODO(fork): Decoy 격리 강화 (setrlimit, 권한 하향, chroot/네임스페이스 등)
         logger::write("FORK", conn + " decoy child started");
+        isolate_decoy(conn);  // 응답 생성(Redaction 포함) 전에 자원 제한부터 건다
         return ForkResult::Child;
     }
 
