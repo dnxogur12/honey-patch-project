@@ -16,6 +16,7 @@ namespace hp::http {
 namespace {
 
 constexpr size_t kMaxHeaderBytes = 8192;
+constexpr size_t kMaxBodyBytes = 64 * 1024; // 본문 크기 상한
 
 bool send_all(int fd, const std::string& data) {
     size_t off = 0;
@@ -59,7 +60,6 @@ void serve_connection(ConnContext& ctx, const Handler& handler) {
         }
         std::string raw = buf.substr(0, end + 4);
         buf.erase(0, end + 4);
-        // TODO(HTTP): Content-Length 본문 처리. 현재는 GET 전용으로 본문을 읽지 않는다.
 
         HttpRequest req;
         std::string err;
@@ -67,6 +67,37 @@ void serve_connection(ConnContext& ctx, const Handler& handler) {
             logger::write("HTTP", "conn=" + std::to_string(ctx.conn_id) + " bad request: " + err);
             send_error(ctx.client_fd, 400, "bad request\n");
             return;
+        }
+        // Content-Length 본문 처리: 앱은 GET 전용이라 본문을 쓰지 않지만,
+        // 다음 요청과의 경계를 맞추기 위해 본문만큼 읽어서 버린다 (요청 밀반입 방지).
+        if (req.headers.count("transfer-encoding")) {  // chunked 등은 지원하지 않음
+            logger::write("HTTP", "conn=" + std::to_string(ctx.conn_id) + " bad request: transfer-encoding unsupported");
+            send_error(ctx.client_fd, 400, "bad request\n");
+            return;
+        }
+        if (auto it = req.headers.find("content-length"); it != req.headers.end()) {
+            const std::string& v = it->second;
+            if (v.empty() || v.size() > 9 || v.find_first_not_of("0123456789") != std::string::npos) {
+                logger::write("HTTP", "conn=" + std::to_string(ctx.conn_id) + " bad request: invalid content-length");
+                send_error(ctx.client_fd, 400, "bad request\n");
+                return;
+            }
+            size_t body_len = std::stoul(v);
+            if (body_len > kMaxBodyBytes) {
+                send_error(ctx.client_fd, 413, "payload too large\n");
+                return;
+            }
+            while (buf.size() < body_len) {  // 본문이 덜 왔으면 마저 읽음
+                char tmp[4096];
+                ssize_t n = ::recv(ctx.client_fd, tmp, sizeof tmp, 0);
+                if (n == 0) return;
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    return;
+                }
+                buf.append(tmp, static_cast<size_t>(n));
+            }
+            buf.erase(0, body_len);
         }
         logger::write("HTTP", "conn=" + std::to_string(ctx.conn_id) + " " + req.method + " " +
                                   req.target);
