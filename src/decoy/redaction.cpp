@@ -1,25 +1,48 @@
 #include "decoy/redaction.h"
 
+#include <fstream>
+#include <sstream>
+#include <string>
+
 #include "common/logger.h"
 
 namespace hp::decoy {
-
 namespace {
 
-// 컴파일러 최적화로 제거되지 않도록 volatile 포인터로 0 덮어쓰기
-void secure_wipe(std::string& s) {
-    volatile char* p = s.data();
-    for (size_t i = 0; i < s.size(); ++i) p[i] = 0;
-    s.clear();
-    s.shrink_to_fit();
+void secure_wipe(std::string& value) {
+    volatile char* bytes = value.data();
+    for (std::size_t i = 0; i < value.size(); ++i) bytes[i] = '\0';
+    value.clear();
 }
 
-// 항목별 가짜 값. 공격자가 '성공했다'고 믿을 만큼 실제 형식과 비슷해야 한다.
-// TODO(Decoy): 하드코딩 대신 www/decoy/ 등의 honey data 파일에서 로드
-// TODO(Decoy): 원본과 같은 형식(키 이름·줄 수·길이)을 유지하는 가짜 값 생성
-std::string fake_value_for(const std::string& key) {
+// Honey Data format: [entry name] on its own line, followed by lines of data.
+// The next [entry name] begins a new entry.
+std::map<std::string, std::string> load_honey_data() {
+    std::map<std::string, std::string> data;
+    std::ifstream file("www/decoy/honey_data.txt", std::ios::binary);
+    if (!file) {
+        logger::write("DECOY", "honey data file unavailable; using built-in fallback");
+        return data;
+    }
+
+    std::string line;
+    std::string key;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.size() >= 3 && line.front() == '[' && line.back() == ']') {
+            key = line.substr(1, line.size() - 2);
+            if (key.empty()) continue;
+            data[key] = "";
+        } else if (!key.empty()) {
+            data[key] += line + "\n";
+        }
+    }
+    return data;
+}
+
+std::string fallback_value(const std::string& key) {
     if (key == "secret.txt")
-        return "# internal config\n"
+        return "# TEST SECRET - decoy honey data\n"
                "FLAG=CNU{w3lc0me_t0_th3_s3rv3r}\n"
                "db_user=admin\n"
                "db_password=Spring2026!\n";
@@ -30,13 +53,15 @@ std::string fake_value_for(const std::string& key) {
 }  // namespace
 
 void redact(SecretStore& store) {
+    const auto honey = load_honey_data();
     for (auto& [key, value] : store.entries) {
         secure_wipe(value);
-        value = fake_value_for(key);
+        auto it = honey.find(key);
+        value = (it != honey.end() && !it->second.empty()) ? it->second : fallback_value(key);
     }
     logger::write("DECOY", "redacted " + std::to_string(store.entries.size()) + " secret entries");
-    // 한계(TODO): std::string 이전 버퍼·파일 읽기 중간 버퍼 등 힙에 남은 사본은 지우지 못한다.
-    //            원논문은 프로세스 메모리 전체를 대상으로 하므로 차이로 기록할 것.
+    // Limitation: this wipes only the selected SecretStore strings, not every
+    // transient copy in process memory. This is not full-process redaction.
 }
 
 }  // namespace hp::decoy
