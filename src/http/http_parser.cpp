@@ -28,7 +28,8 @@ std::string trim(const std::string& s) {
     return s.substr(b, e - b + 1);
 }
 
-void parse_query(const std::string& qs, std::map<std::string, std::string>& out) {
+// 함수 리턴타입 void -> bool, 중복 키 발견 시 false 반환(요청거부목적)
+bool parse_query(const std::string& qs, std::map<std::string, std::string>& out) {
     size_t pos = 0;
     while (pos <= qs.size()) {
         size_t amp = qs.find('&', pos);
@@ -38,11 +39,12 @@ void parse_query(const std::string& qs, std::map<std::string, std::string>& out)
             size_t eq = pair.find('=');
             std::string k = pair.substr(0, eq);
             std::string v = (eq == std::string::npos) ? "" : pair.substr(eq + 1);
-            // 중복 키는 첫 값 유지. TODO(HTTP): 중복 파라미터 정책 결정 (HTTP Parameter Pollution)
-            out.emplace(url_decode(k, true), url_decode(v, true));
+            // 중복 키가 오면 요청 전체를 거부 (HTTP Parameter Pollution 방지)
+            if (!out.emplace(url_decode(k, true), url_decode(v, true)).second) return false;
         }
         pos = amp + 1;
     }
+    return true;
 }
 
 const char* reason_phrase(int status) {
@@ -52,6 +54,7 @@ const char* reason_phrase(int status) {
         case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
+        case 413: return "Payload Too Large"; // 본문이 64KB 넘을 시 413
         case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
         default:  return "Unknown";
@@ -97,7 +100,10 @@ bool parse_request(const std::string& raw, HttpRequest& out, std::string* err) {
 
     size_t q = out.target.find('?');
     out.path = url_decode(out.target.substr(0, q));
-    if (q != std::string::npos) parse_query(out.target.substr(q + 1), out.query);
+
+    // parse_query()로부터 중복 발견 true/false 값을 받도록 추가
+    if (q != std::string::npos && !parse_query(out.target.substr(q + 1), out.query))
+        return fail("duplicate query parameter");
 
     // 헤더
     while (std::getline(in, line)) {
