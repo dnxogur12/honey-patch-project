@@ -1,7 +1,7 @@
 [secret.txt]
 # TEST SECRET - configuration
-FLAG=REAL_SECRET{8c41b7e2}
+FLAG=CNU{8c41b7e2}
 db_user=root
-db_password=REAL_SECRET_db_pass_demo
+db_password=Spring2026_demo
 [admin_token]
 adm-6f1d2c9e8b7a4d3c
