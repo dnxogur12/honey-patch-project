@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """13주차 추가 검증 사례 — 타이밍 채널 (원논문 6.2 한계 확인).
 
-  T1 attack_vs_normal_timing : 공격 요청이 정상 요청보다 얼마나 느린지(중앙값 차이)를
-                               미패치 서버와 허니패치 서버에서 각각 재고 비교
-                               → 허니패치의 차이가 미패치의 차이보다 크면 "느리다"
-                                 (미패치에도 원래 있는 차이를 빼고도 남는 지연 = fork + redaction)
+  T1 attack_vs_normal_timing : 허니패치 서버에서 공격 요청이 정상 요청보다 느린지(중앙값 비교)
+                               → 공격 응답만 늦어지면 공격자가 시간만으로 Decoy를 눈치챌 수 있음
+                                 (원논문 §7: 같은 서버에서 공격 응답이 정상 응답보다 늦어지는 것을 우려)
 
   python3 tests/run_timing_cases.py [--bin build/honeypatch_server] [--root www] [--rounds 10] [--n 30]
-결과: results/extra13_timing/ (unpatched·honeypatch defender.log, result.json). 표준 라이브러리만 사용.
+결과: results/extra13_timing/ (honeypatch/defender.log, result.json). 표준 라이브러리만 사용.
 
 측정 방법
-  - 미패치·허니패치 서버를 동시에 띄우고, 한 라운드 안에서 두 서버에 번갈아 요청 (시점 편향 최소화)
+  - 허니패치 서버 하나에 공격·정상 요청을 번갈아 보냄 (시점 편향 최소화)
   - 요청마다 새 연결, Connection: close  → 허니패치 공격 1건 = Decoy 1개, 응답 후 Decoy 종료
   - 시간 = 요청 전송 직전 ~ 응답 전체 수신 (연결 수립 시간 제외)
   - 공격: ../secret.txt   정상: readme.txt (같은 /files 처리 경로, 비교 공정성)
-  - 라운드마다 각 서버의 (공격 중앙값 - 정상 중앙값)을 구해 비교, 이를 여러 라운드 반복
+  - 라운드마다 공격 중앙값과 정상 중앙값을 비교, 이를 여러 라운드 반복
   - 처음 몇 건은 워밍업으로 버림, 요청 사이 간격을 둬 Decoy가 종료·회수되게 함 (상한 16 회피)
 """
 import argparse
@@ -29,7 +28,7 @@ import time
 from run_cases import SECRET_MARKER, count_forks, free_port, read_response, wait_ready
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODES = ["unpatched", "honeypatch"]
+MODES = ["honeypatch"]
 
 ATTACK = "/files?name=../secret.txt"
 NORMAL = "/files?name=readme.txt"
@@ -37,12 +36,10 @@ NORMAL = "/files?name=readme.txt"
 # ==============================================================================
 # 기대 결과 (실행 전에 작성)
 # ==============================================================================
-# 원논문 6.2: redaction 등으로 공격 응답이 늦어지는 타이밍 채널이 남는다고 인정.
-# 미패치 서버에서도 파일 크기 등으로 공격·정상 시간이 조금 다를 수 있으므로, 미패치의 차이를 기준선으로 삼는다.
-#   - 측정 조건: 미패치 공격·정상 모두 200 / 허니패치 공격·정상 모두 200, 실제 비밀 노출 없음,
-#               허니패치 Decoy 생성 수 = 허니패치 공격 수(워밍업 포함)
-#   - 판정: 라운드마다 (허니패치 공격 중앙값 - 정상 중앙값) > (미패치 공격 중앙값 - 정상 중앙값) 이면 "느림"
-#           "느림" 라운드가 전체의 90% 이상이면 → 허니패치 공격 응답이 느리다 (타이밍 채널 존재, 한계 확인)
+# 원논문 6.2/7: redaction 등으로 공격 응답이 정상 응답보다 늦어지는 타이밍 채널이 남는다고 인정.
+#   - 측정 조건: 공격·정상 모두 200, 실제 비밀 노출 없음, Decoy 생성 수 = 공격 수(워밍업 포함)
+#   - 판정: 라운드마다 공격 중앙값 > 정상 중앙값 이면 "느림"
+#           "느림" 라운드가 전체의 90% 이상이면 → 공격 응답이 느리다 (타이밍 채널 존재, 한계 확인)
 SLOW_RATIO_REQUIRED = 0.9
 
 
@@ -65,16 +62,16 @@ def main():
     ap.add_argument("--root", default=os.path.join(ROOT_DIR, "www"))
     ap.add_argument("--out", default=os.path.join(ROOT_DIR, "results", "extra13_timing"))
     ap.add_argument("--rounds", type=int, default=10, help="라운드 수")
-    ap.add_argument("--n", type=int, default=30, help="라운드당 서버별 공격/정상 각각 측정 횟수")
+    ap.add_argument("--n", type=int, default=30, help="라운드당 공격/정상 각각 측정 횟수")
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--gap", type=float, default=0.02, help="요청 사이 간격(초)")
     args = ap.parse_args()
 
     print("[기대 결과 — 실행 전 작성]")
-    print(f"  라운드 {args.rounds}회 x 서버별 공격/정상 각 {args.n}건")
-    print("  측정 조건: 모든 응답 200, 허니패치 실제 비밀 노출 없음, "
-          f"허니패치 Decoy 수 = {args.warmup + args.rounds * args.n}")
-    print("  라운드 판정: 허니패치(공격-정상 중앙값) > 미패치(공격-정상 중앙값) 이면 '느림'")
+    print(f"  라운드 {args.rounds}회 x 공격/정상 각 {args.n}건 (허니패치 서버)")
+    print("  측정 조건: 모든 응답 200, 실제 비밀 노출 없음, "
+          f"Decoy 수 = {args.warmup + args.rounds * args.n}")
+    print("  라운드 판정: 공격 중앙값 > 정상 중앙값 이면 '느림'")
     print(f"  최종: '느림' 라운드 >= {SLOW_RATIO_REQUIRED:.0%}  (원논문 6.2 타이밍 채널이 남는다고 예상)\n")
 
     servers, logs = {}, {}
@@ -126,7 +123,7 @@ def main():
             proc.wait()
 
     med = statistics.median
-    print(f"{'round':>5} | {'미패치 공격':>10}{'정상':>8}{'차이':>8} | {'허니패치 공격':>11}{'정상':>8}{'차이':>8} | 판정   (ms)")
+    print(f"{'round':>5} | {'공격':>8}{'정상':>8}{'차이':>8} | 판정   (ms)")
     slow = 0
     round_rows = []
     for i, rec in enumerate(rounds, 1):
@@ -134,33 +131,27 @@ def main():
         for mode in MODES:
             a, n = med(rec[mode]["attack"]), med(rec[mode]["normal"])
             row[mode] = {"attack": a, "normal": n, "diff": a - n}
-        is_slow = row["honeypatch"]["diff"] > row["unpatched"]["diff"]
+        h = row["honeypatch"]
+        is_slow = h["attack"] > h["normal"]
         slow += is_slow
-        round_rows.append({**row, "slow": is_slow})
-        u, h = row["unpatched"], row["honeypatch"]
-        print(f"{i:>5} | {u['attack']:10.3f}{u['normal']:8.3f}{u['diff']:+8.3f} | "
-              f"{h['attack']:11.3f}{h['normal']:8.3f}{h['diff']:+8.3f} | {'느림' if is_slow else '아님'}")
+        round_rows.append({**h, "slow": is_slow})
+        print(f"{i:>5} | {h['attack']:8.3f}{h['normal']:8.3f}{h['diff']:+8.3f} | {'느림' if is_slow else '아님'}")
 
     overall = {}
     for mode in MODES:
         a = med([x for rec in rounds for x in rec[mode]["attack"]])
         n = med([x for rec in rounds for x in rec[mode]["normal"]])
         overall[mode] = {"attack": a, "normal": n, "diff": a - n}
-    extra = overall["honeypatch"]["diff"] - overall["unpatched"]["diff"]
-    print(f"\n전체 중앙값  미패치: 공격 {overall['unpatched']['attack']:.3f} / 정상 {overall['unpatched']['normal']:.3f}"
-          f" / 차이 {overall['unpatched']['diff']:+.3f} ms")
-    print(f"            허니패치: 공격 {overall['honeypatch']['attack']:.3f} / 정상 {overall['honeypatch']['normal']:.3f}"
-          f" / 차이 {overall['honeypatch']['diff']:+.3f} ms")
-    print(f"미패치 대비 허니패치 공격의 추가 지연: {extra:+.3f} ms\n")
+    o = overall["honeypatch"]
+    print(f"\n전체 중앙값  공격 {o['attack']:.3f} / 정상 {o['normal']:.3f} / 차이 {o['diff']:+.3f} ms"
+          f" ({o['attack'] / o['normal']:.2f}배)\n")
 
     expected_forks = args.warmup + args.rounds * args.n
     checks = [
-        ("기대: 미패치 응답 모두 200", all(s == 200 for s in statuses["unpatched"]),
-         f"{statuses['unpatched'].count(200)}/{len(statuses['unpatched'])}"),
-        ("기대: 허니패치 응답 모두 200", all(s == 200 for s in statuses["honeypatch"]),
+        ("기대: 응답 모두 200", all(s == 200 for s in statuses["honeypatch"]),
          f"{statuses['honeypatch'].count(200)}/{len(statuses['honeypatch'])}"),
-        ("기대: 허니패치 공격 응답에 실제 비밀 없음", not leaked, f"leaked={leaked}"),
-        ("기대: 허니패치 Decoy 생성 수 = 공격 수", forks == expected_forks, f"{forks}/{expected_forks}"),
+        ("기대: 공격 응답에 실제 비밀 없음", not leaked, f"leaked={leaked}"),
+        ("기대: Decoy 생성 수 = 공격 수", forks == expected_forks, f"{forks}/{expected_forks}"),
         (f"기대: '느림' 라운드 >= {SLOW_RATIO_REQUIRED:.0%}", slow >= SLOW_RATIO_REQUIRED * args.rounds,
          f"실제: {slow}/{args.rounds} 라운드 느림"),
     ]
@@ -169,7 +160,7 @@ def main():
 
     with open(os.path.join(args.out, "result.json"), "w", encoding="utf-8") as f:
         json.dump({"rounds": args.rounds, "n_per_round": args.n, "slow_rounds": slow,
-                   "overall_median_ms": overall, "extra_delay_ms": extra,
+                   "overall_median_ms": overall["honeypatch"],
                    "per_round": round_rows, "forks": forks,
                    "checks": {name: ok for name, ok, _ in checks}}, f, ensure_ascii=False, indent=2)
 
