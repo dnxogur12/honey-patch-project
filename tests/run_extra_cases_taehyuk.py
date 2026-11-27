@@ -84,8 +84,12 @@ EXPECT = {
 def send_and_collect(port: int, target: str, log_path: str) -> dict:
     """단일 요청을 전송하고 응답 상태·비밀 노출·fork 수·탐지 로그 여부를 반환한다."""
     forks_before = count_forks(log_path)
-    with open(log_path, encoding="utf-8", errors="replace") as f:
-        log_before = f.read()
+
+    log_before = ""
+    if os.path.exists(log_path):
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            log_before = str(f.read())
+    start_idx = int(len(log_before))
 
     with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
         status, raw = request(sock, target, keep_alive=False)
@@ -93,8 +97,11 @@ def send_and_collect(port: int, target: str, log_path: str) -> dict:
     # Decoy 자식 프로세스가 로그를 기록할 시간 확보
     time.sleep(0.1)
 
-    with open(log_path, encoding="utf-8", errors="replace") as f:
-        new_log = f.read()[log_before:]
+    new_log = ""
+    if os.path.exists(log_path):
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            full_log = str(f.read())
+            new_log = full_log[start_idx:]
 
     return {
         "status": status,
