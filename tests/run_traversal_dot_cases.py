@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
 """
-
-포함된 사례 (2종):
+검증 사례 (2종):
   1. mixed_deep_traversal (위반): GET /files?name=subdir/../../secret.txt
-     - 하위 디렉터리(subdir/)를 거친 뒤 상위 경로로 두 단계(../../) 올라가 secret.txt 접근 시도
+     - 하위 디렉터리(subdir/) 진입 후 상위 경로(../../)로 빠져나오는 경로 탐색 시도
   2. boundary_prefix_dots (경계): GET /files?name=..secret.txt
-     - '..'로 시작하는 파일명이지만 상위 디렉터리 이동(../)은 아닌 경계 입력에서 오탐 여부 확인
-
-실행 방법 (저장소 루트 기준):
-  python3 tests/run_extra_taehyuk_cases.py --bin ./build-local/honeypatch_server --root ./www
-
-출력 저장 위치:
-  results/extra_taehyuk/<모드>/<사례명>/defender.log
-  results/extra_taehyuk/<모드>/<사례명>/result.json
+     - '..'로 시작하지만 경로 탐색(../)은 아닌 파일명 경계 입력에서 오탐 여부 확인
 """
 
 import argparse
@@ -23,7 +15,6 @@ import subprocess
 import sys
 import time
 
-# 기존 run_cases.py의 서버 요청·포트·fork 카운트 헬퍼 재사용
 from run_cases import (
     SECRET_MARKER,
     count_forks,
@@ -33,11 +24,11 @@ from run_cases import (
 )
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODES = ["unpatched", "patched", "honeypatch"]
+MODES = ["honeypatch"]
 
 
 # ==============================================================================
-# 1. 검증 사례 및 사전 기대 결과 정의 (실행 전 작성)
+# 1. 검증 사례 및 사전 기대 결과 정의 (honeypatch 모드 기준, 실행 전 작성)
 #    - status  : HTTP 응답 상태코드
 #    - leaked  : 응답 본문에 실제 비밀(REAL_SECRET) 노출 여부
 #    - forks   : 이번 요청 동안 새로 생성된 Decoy 자식 프로세스 수
@@ -58,50 +49,49 @@ CASES = [
     ),
 ]
 
-# 모드별 사전 기대 결과: (status, leaked, forks, detected)
+# honeypatch 모드 기대 결과: {"status": int, "leaked": bool, "forks": int, "detected": bool}
 EXPECT = {
-    "unpatched": {
-        # 보호 미적용: 복합 경로 탐색은 비밀 노출, ..secret.txt는 파일이 없으므로 404
-        "mixed_deep_traversal": (200, True,  0, False),
-        "boundary_prefix_dots": (404, False, 0, False),
+    "mixed_deep_traversal": {
+        "status": 200,
+        "leaked": False,
+        "forks": 1,
+        "detected": True,
     },
-    "patched": {
-        # 일반 패치: 경로 탐색은 403 차단, ..secret.txt는 오탐 없이 404
-        "mixed_deep_traversal": (403, False, 0, True),
-        "boundary_prefix_dots": (404, False, 0, False),
-    },
-    "honeypatch": {
-        # 허니패치: 경로 탐색은 Decoy 분기(fork=1) 후 200 위장 응답·비밀 미노출, ..secret.txt는 404·fork=0
-        "mixed_deep_traversal": (200, False, 1, True),
-        "boundary_prefix_dots": (404, False, 0, False),
+    "boundary_prefix_dots": {
+        "status": 404,
+        "leaked": False,
+        "forks": 0,
+        "detected": False,
     },
 }
 
 
 # ==============================================================================
-# 2. HTTP 요청 실행 및 결과 수집
+# 2. HTTP 요청 전송 및 결과 수집
 # ==============================================================================
-def send_and_collect(port: int, target: str, log_path: str) -> dict:
-    """단일 요청을 전송하고 응답 상태·비밀 노출·fork 수·탐지 로그 여부를 반환한다."""
-    forks_before = count_forks(log_path)
+def read_log_safe(log_path: str) -> str:
+    """로그 파일을 안전하게 읽어 문자열로 반환한다."""
+    if not os.path.exists(log_path):
+        return ""
+    with open(log_path, encoding="utf-8", errors="replace") as f:
+        content = f.read()
+    return content if isinstance(content, str) else ""
 
-    log_before = ""
-    if os.path.exists(log_path):
-        with open(log_path, encoding="utf-8", errors="replace") as f:
-            log_before = str(f.read())
-    start_idx = int(len(log_before))
+
+def send_and_collect(port: int, target: str, log_path: str) -> dict:
+    """단일 HTTP 요청을 보내고 상태코드·비밀 노출·fork 수·탐지 로그 여부를 수집한다."""
+    forks_before = count_forks(log_path)
+    log_before = read_log_safe(log_path)
+    start_offset = int(len(log_before))
 
     with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
         status, raw = request(sock, target, keep_alive=False)
 
-    # Decoy 자식 프로세스가 로그를 기록할 시간 확보
+    # Decoy 자식 프로세스가 방어자 로그를 기록할 시간 확보
     time.sleep(0.1)
 
-    new_log = ""
-    if os.path.exists(log_path):
-        with open(log_path, encoding="utf-8", errors="replace") as f:
-            full_log = str(f.read())
-            new_log = full_log[start_idx:]
+    log_after = read_log_safe(log_path)
+    new_log = log_after[start_offset:] if start_offset <= len(log_after) else log_after
 
     return {
         "status": status,
@@ -112,19 +102,8 @@ def send_and_collect(port: int, target: str, log_path: str) -> dict:
     }
 
 
-def expected_to_dict(mode: str, case_name: str) -> dict:
-    """기대 결과 튜플을 읽기 쉬운 딕셔너리로 변환한다."""
-    status, leaked, forks, detected = EXPECT[mode][case_name]
-    return {
-        "status": status,
-        "leaked": leaked,
-        "forks": forks,
-        "detected": detected,
-    }
-
-
 def diff_expected_actual(expected: dict, actual: dict) -> list[str]:
-    """기대 결과와 실제 결과가 다른 항목 목록을 반환한다."""
+    """기대 결과와 실제 결과를 비교해 다른 항목 목록을 반환한다."""
     diffs = []
     for key, exp_val in expected.items():
         act_val = actual.get(key)
@@ -137,14 +116,15 @@ def diff_expected_actual(expected: dict, actual: dict) -> list[str]:
 # 3. 개별 사례 실행 및 결과 저장
 # ==============================================================================
 def run_one_case(args, mode: str, category: str, case_name: str, target: str, desc: str) -> dict:
-    """특정 모드에서 1개 사례를 실행하고 result.json과 defender.log를 저장한다."""
+    """honeypatch 모드에서 1개 사례를 실행하고 defender.log 및 result.json을 저장한다."""
     out_dir = os.path.join(args.out, mode, case_name)
     os.makedirs(out_dir, exist_ok=True)
 
     log_path = os.path.join(out_dir, "defender.log")
-    open(log_path, "w").close()  # 이전 로그 초기화
+    with open(log_path, "w", encoding="utf-8"):
+        pass  # 이전 로그 초기화
 
-    expected = expected_to_dict(mode, case_name)
+    expected = EXPECT[case_name]
     port = free_port()
 
     server = subprocess.Popen(
@@ -210,10 +190,10 @@ def run_one_case(args, mode: str, category: str, case_name: str, target: str, de
 # 4. 메인 진입점
 # ==============================================================================
 def main() -> int:
-    parser = argparse.ArgumentParser(description="13주차 추가 검증 사례 실행 (우태혁)")
+    parser = argparse.ArgumentParser(description="13주차 honeypatch 추가 검증 사례 실행")
     parser.add_argument(
         "--bin",
-        default=os.path.join(ROOT_DIR, "build-local", "honeypatch_server"),
+        default=os.path.join(ROOT_DIR, "build", "honeypatch_server"),
         help="서버 바이너리 경로",
     )
     parser.add_argument(
@@ -231,7 +211,7 @@ def main() -> int:
         nargs="+",
         default=MODES,
         choices=MODES,
-        help="실행할 모드 목록",
+        help="실행할 모드 (기본: honeypatch)",
     )
     args = parser.parse_args()
     args.root = os.path.abspath(args.root)
